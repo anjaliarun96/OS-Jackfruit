@@ -260,6 +260,15 @@ static void sigchld_handler(int sig) {
     printf("[supervisor] container '%s' started, host PID %d\n", name, pid);
     return pid;
 }
+void run_supervisor() {
+    printf("Supervisor running\n");
+    launch_container("alpha", "../rootfs-alpha", ...);
+launch_container("beta", "../rootfs-beta", ...);
+
+    while (1) {
+        sleep(5);
+    }
+}
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
 int main() {
@@ -277,6 +286,9 @@ int main() {
     clone(container_main, clone_stack + STACK_SIZE,
           CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
           &args);
+    if (strcmp(argv[1], "supervisor") == 0) {
+    run_supervisor();
+}
 
     wait(NULL);
 }
