@@ -51,7 +51,18 @@ typedef enum {
     STATE_KILLED,
     STATE_HARD_LIMIT_KILLED,
 } ContainerState;
+typedef struct {
+    char name[MAX_NAME];
+    pid_t host_pid;
+    time_t start_time;
+    ContainerState state;
+} Container;
 
+c->host_pid = pid;
+c->state = STATE_RUNNING;
+c->start_time = time(NULL);
+
+static Container containers[MAX_CONTAINERS];
 static const char *state_str(ContainerState s) {
     switch (s) {
         case STATE_EMPTY:            return "empty";
