@@ -1,66 +1,70 @@
 /*
- * io_pulse.c - I/O-oriented workload for scheduler experiments.
+ * io_pulse.c — I/O-bound workload for scheduling experiments (Task 5)
  *
- * Usage:
- *   /io_pulse [iterations] [sleep_ms]
+ * Usage: ./io_pulse [seconds]   (default: 30 seconds)
  *
- * The program writes small bursts to a file and sleeps between them.
- * This gives students an easy I/O-heavy workload to compare with
- * cpu_hog when discussing responsiveness and scheduler behavior.
- *
- * If you copy this binary into an Alpine rootfs, make sure it is built in a
- * format that can run there.
+ * Repeatedly writes and reads a temp file to generate I/O load.
+ * Mostly sleeps while waiting for I/O, leaving the CPU idle.
+ * Useful for demonstrating how the Linux CFS scheduler treats I/O-bound
+ * vs CPU-bound processes differently.
  */
-
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
-#define DEFAULT_OUTPUT "/tmp/io_pulse.out"
+#define BUF_SIZE (4 * 1024)    /* 4 KB */
 
-static unsigned int parse_uint(const char *arg, unsigned int fallback)
-{
-    char *end = NULL;
-    unsigned long value = strtoul(arg, &end, 10);
+static volatile int running = 1;
+static void handle_sig(int s) { (void)s; running = 0; }
 
-    if (!arg || *arg == '\0' || (end && *end != '\0') || value == 0)
-        return fallback;
-    return (unsigned int)value;
-}
+int main(int argc, char *argv[]) {
+    int seconds = 30;
+    if (argc > 1) seconds = atoi(argv[1]);
 
-int main(int argc, char *argv[])
-{
-    const unsigned int iterations = (argc > 1) ? parse_uint(argv[1], 20) : 20;
-    const unsigned int sleep_ms = (argc > 2) ? parse_uint(argv[2], 200) : 200;
-    int fd;
-    unsigned int i;
+    signal(SIGTERM, handle_sig);
+    signal(SIGINT,  handle_sig);
 
-    fd = open(DEFAULT_OUTPUT, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) {
-        perror("open");
-        return 1;
-    }
+    printf("[io_pulse] PID=%d, running for %ds\n", (int)getpid(), seconds);
+    fflush(stdout);
 
-    for (i = 0; i < iterations; i++) {
-        char line[128];
-        int len = snprintf(line, sizeof(line), "io_pulse iteration=%u\n", i + 1);
+    char buf[BUF_SIZE];
+    memset(buf, 'X', sizeof(buf));
 
-        if (write(fd, line, (size_t)len) != len) {
-            perror("write");
-            close(fd);
-            return 1;
+    time_t start = time(NULL);
+    long   ops   = 0;
+
+    while (running) {
+        time_t elapsed = time(NULL) - start;
+        if (elapsed >= seconds) break;
+
+        /* Write to a temp file */
+        FILE *f = fopen("/tmp/io_pulse_tmp", "w");
+        if (f) {
+            fwrite(buf, 1, sizeof(buf), f);
+            fflush(f);
+            fclose(f);
         }
+        /* Read it back */
+        f = fopen("/tmp/io_pulse_tmp", "r");
+        if (f) {
+            fread(buf, 1, sizeof(buf), f);
+            fclose(f);
+        }
+        ops++;
 
-        fsync(fd);
-        printf("io_pulse wrote iteration=%u\n", i + 1);
-        fflush(stdout);
-        usleep(sleep_ms * 1000U);
+        if (ops % 100 == 0) {
+            printf("[io_pulse] elapsed=%lds ops=%ld\n", elapsed, ops);
+            fflush(stdout);
+        }
+        /* Small sleep to model I/O wait */
+        usleep(5000);
     }
 
-    close(fd);
+    time_t total = time(NULL) - start;
+    printf("[io_pulse] done. total_ops=%ld elapsed=%lds\n", ops, total);
     return 0;
 }
+

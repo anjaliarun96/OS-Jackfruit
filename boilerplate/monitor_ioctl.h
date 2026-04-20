@@ -1,15 +1,20 @@
 #ifndef MONITOR_IOCTL_H
 #define MONITOR_IOCTL_H
 
-#define MONITOR_IOCTL_MAGIC 'M'
+#include <linux/ioctl.h>
 
-#define MONITOR_REGISTER   _IOW(MONITOR_IOCTL_MAGIC, 1, struct monitor_request)
-#define MONITOR_UNREGISTER _IOW(MONITOR_IOCTL_MAGIC, 2, struct monitor_request)
+#define MONITOR_IOC_MAGIC  'M'
 
-struct monitor_request {
-    pid_t pid;
-    unsigned long soft_limit_bytes;
-    unsigned long hard_limit_bytes;
+/* Information passed from user-space to kernel when registering a container */
+struct container_info {
+    pid_t         pid;
+    unsigned long soft_limit;   /* bytes */
+    unsigned long hard_limit;   /* bytes */
 };
 
-#endif
+/* ioctl commands */
+#define CONTAINER_MONITOR_REGISTER   _IOW(MONITOR_IOC_MAGIC, 1, struct container_info)
+#define CONTAINER_MONITOR_UNREGISTER _IOW(MONITOR_IOC_MAGIC, 2, pid_t)
+
+#endif /* MONITOR_IOCTL_H */
+

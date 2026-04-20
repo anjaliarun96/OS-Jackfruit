@@ -1,55 +1,51 @@
-# ============================================================
-# Makefile — Multi-Container Runtime
-# ============================================================
+# Makefile for OS-Jackfruit: Multi-Container Runtime
+#
+# Usage:
+#   make              — build everything
+#   make engine       — build user-space runtime only
+#   make monitor      — build kernel module only
+#   make workloads    — build test workload binaries
+#   make clean        — remove all build artifacts
 
-CC        = gcc
-CFLAGS    = -Wall -Wextra -g -O2 -D_GNU_SOURCE
-LDFLAGS   = -lpthread
+KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
 
-KDIR     ?= /lib/modules/$(shell uname -r)/build
-PWD_DIR  := $(shell pwd)
+# User-space flags
+CC       = gcc
+CFLAGS   = -Wall -Wextra -O2 -pthread -D_GNU_SOURCE
+LDFLAGS  = -pthread
 
-.PHONY: all clean ci module userspace workloads boilerplate/ci
+# Kernel module sources
+obj-m := monitor.o
 
-# Default: build everything
-all: userspace module workloads
+.PHONY: all engine monitor workloads clean
 
-# ---- User-space runtime ------------------------------------
-userspace: engine
+all: engine monitor workloads
 
+# ── User-space engine ──────────────────────────────────────────────────────
 engine: engine.c monitor_ioctl.h
-	$(CC) $(CFLAGS) -o $@ engine.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o engine engine.c $(LDFLAGS)
 
-# ---- Workload binaries -------------------------------------
-workloads: cpu_hog memory_hog io_pulse
+# ── Kernel module ──────────────────────────────────────────────────────────
+monitor: monitor.c monitor_ioctl.h
+	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) modules
+	@echo "Kernel module built: monitor.ko"
+
+# ── Workload binaries ─────────────────────────────────────────────────────
+workloads: cpu_hog io_pulse memory_hog
 
 cpu_hog: cpu_hog.c
-	$(CC) $(CFLAGS) -o $@ cpu_hog.c
-
-memory_hog: memory_hog.c
-	$(CC) $(CFLAGS) -o $@ memory_hog.c
+	$(CC) $(CFLAGS) -o cpu_hog cpu_hog.c
 
 io_pulse: io_pulse.c
-	$(CC) $(CFLAGS) -o $@ io_pulse.c
-# ---- Kernel module -----------------------------------------
-module: Kbuild
-	$(MAKE) -C $(KDIR) M=$(PWD_DIR) modules
+	$(CC) $(CFLAGS) -o io_pulse io_pulse.c
 
-Kbuild:
-	@echo "obj-m := monitor.o" > Kbuild
+memory_hog: memory_hog.c
+	$(CC) $(CFLAGS) -o memory_hog memory_hog.c
 
-# ---- CI-safe target (GitHub Actions / no kernel headers) ---
-# Builds only user-space; no sudo, module loading, or rootfs required.
-ci: engine workloads
-	@echo "CI build OK (user-space only)"
-
-# Required by project spec: make -C boilerplate ci
-boilerplate/ci: ci
-
-# ---- Clean -------------------------------------------------
+# ── Clean ─────────────────────────────────────────────────────────────────
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD_DIR) clean 2>/dev/null || true
-	rm -f Kbuild Module.symvers modules.order
-	rm -f *.o *.ko *.mod.c *.mod
-	rm -f .*.cmd
+	rm -f engine cpu_hog io_pulse memory_hog
+	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean 2>/dev/null || true
+	rm -f *.o *.ko *.mod *.mod.c *.symvers *.order .*.cmd
+	rm -rf .tmp_versions
 

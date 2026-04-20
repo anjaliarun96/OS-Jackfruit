@@ -1,64 +1,69 @@
 /*
- * memory_hog.c - Memory pressure workload for soft / hard limit testing.
+ * memory_hog.c — Memory-consuming workload for kernel monitor testing (Task 4)
  *
- * Default behavior:
- *   - allocate 8 MiB every second
- *   - touch each page so RSS actually grows
+ * Usage: ./memory_hog [target_mib] [seconds]   (default: 64 MiB for 20s)
  *
- * Usage:
- *   /memory_hog [chunk_mb] [sleep_ms]
- *
- * If you plan to copy this binary into an Alpine rootfs, build it in a way
- * that is runnable inside that filesystem, such as static linking or
- * rebuilding it from inside the rootfs/toolchain you choose.
+ * Gradually allocates memory to test soft and hard memory limits enforced
+ * by the kernel monitor. Touches each page to actually count toward RSS.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <time.h>
 
-static size_t parse_size_mb(const char *arg, size_t fallback)
-{
-    char *end = NULL;
-    unsigned long value = strtoul(arg, &end, 10);
+static volatile int running = 1;
+static void handle_sig(int s) { (void)s; running = 0; }
 
-    if (!arg || *arg == '\0' || (end && *end != '\0') || value == 0)
-        return fallback;
-    return (size_t)value;
-}
+int main(int argc, char *argv[]) {
+    long target_mib = 64;
+    int  seconds    = 20;
+    if (argc > 1) target_mib = atol(argv[1]);
+    if (argc > 2) seconds    = atoi(argv[2]);
 
-static useconds_t parse_sleep_ms(const char *arg, useconds_t fallback)
-{
-    char *end = NULL;
-    unsigned long value = strtoul(arg, &end, 10);
+    signal(SIGTERM, handle_sig);
+    signal(SIGINT,  handle_sig);
 
-    if (!arg || *arg == '\0' || (end && *end != '\0'))
-        return fallback;
-    return (useconds_t)(value * 1000U);
-}
+    printf("[memory_hog] PID=%d, target=%ldMiB over %ds\n",
+           (int)getpid(), target_mib, seconds);
+    fflush(stdout);
 
-int main(int argc, char *argv[])
-{
-    const size_t chunk_mb = (argc > 1) ? parse_size_mb(argv[1], 8) : 8;
-    const useconds_t sleep_us = (argc > 2) ? parse_sleep_ms(argv[2], 1000U) : 1000U * 1000U;
-    const size_t chunk_bytes = chunk_mb * 1024U * 1024U;
-    int count = 0;
+    long page = 4096;
+    long total_bytes = target_mib * 1024 * 1024;
+    long chunk       = 4 * 1024 * 1024;   /* allocate 4 MiB at a time */
+    long allocated   = 0;
 
-    while (1) {
-        char *mem = malloc(chunk_bytes);
-        if (!mem) {
-            printf("malloc failed after %d allocations\n", count);
+    time_t start = time(NULL);
+
+    while (running && allocated < total_bytes) {
+        char *p = malloc(chunk);
+        if (!p) {
+            fprintf(stderr, "[memory_hog] malloc failed at %ld MiB\n",
+                    allocated >> 20);
             break;
         }
+        /* Touch every page to force RSS */
+        for (long i = 0; i < chunk; i += page)
+            p[i] = 1;
+        allocated += chunk;
 
-        memset(mem, 'A', chunk_bytes);
-        count++;
-        printf("allocation=%d chunk=%zuMB total=%zuMB\n",
-               count, chunk_mb, (size_t)count * chunk_mb);
+        printf("[memory_hog] allocated=%ld MiB\n", allocated >> 20);
         fflush(stdout);
-        usleep(sleep_us);
+        sleep(1);
+
+        if ((time(NULL) - start) >= seconds) break;
     }
 
+    printf("[memory_hog] holding %ld MiB, sleeping...\n", allocated >> 20);
+    fflush(stdout);
+
+    /* Hold memory until killed or timeout */
+    time_t hold_start = time(NULL);
+    while (running && (time(NULL) - hold_start) < seconds)
+        sleep(1);
+
+    printf("[memory_hog] exiting normally\n");
     return 0;
 }
+
