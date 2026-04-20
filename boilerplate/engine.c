@@ -280,7 +280,39 @@ launch_container("beta", "../rootfs-beta", ...);
         sleep(5);
     }
 }
-
+static void sigchld_handler(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        pthread_mutex_lock(&containers_mu);
+        for (int i = 0; i < MAX_CONTAINERS; i++) {
+            if (containers[i].host_pid == pid &&
+                containers[i].state == STATE_RUNNING) {
+                if (containers[i].stop_requested) {
+                    containers[i].state = STATE_STOPPED;
+                } else if (WIFSIGNALED(status) &&
+                           WTERMSIG(status) == SIGKILL) {
+                    containers[i].state = STATE_HARD_LIMIT_KILLED;
+                } else {
+                    containers[i].state = STATE_KILLED;
+                }
+                if (WIFEXITED(status))
+                    containers[i].exit_status = WEXITSTATUS(status);
+                if (WIFSIGNALED(status))
+                    containers[i].exit_signal = WTERMSIG(status);
+                if (containers[i].log_pipe_rd >= 0) {
+                    close(containers[i].log_pipe_rd);
+                    containers[i].log_pipe_rd = -1;
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&containers_mu);
+    }
+    errno = saved_errno;
+}
 /* ─── main ───────────────────────────────────────────────────────────────── */
 int main() {
     char *argv[] = {"/bin/sh", NULL};
