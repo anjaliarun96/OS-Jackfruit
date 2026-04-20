@@ -153,95 +153,9 @@ cd boilerplate && make clean
 
 ---
 
-## 3. Demo with Screenshots
+## 3. Engineering Analysis
 
-> **Note:** Screenshots were captured on Ubuntu 22.04 VM with Secure Boot disabled.
-> Place your actual screenshot files in `screenshots/` and update paths below.
-
-### Screenshot 1 — Multi-container supervision
-
-Two containers (`alpha` and `beta`) running under a single supervisor process.
-Host `ps aux` shows the supervisor and both container processes.
-
-![Multi-container supervision](screenshots/task1/host_processes.png)
-
-*Caption: `ps aux | grep engine` shows the supervisor (engine supervisor) and two container children with distinct host PIDs.*
-
----
-
-### Screenshot 2 — Metadata tracking (`ps` command)
-
-Output of `sudo ./engine ps` showing name, PID, start time, state, memory limits, and log path for each tracked container.
-
-![ps metadata](screenshots/task2/ps_output.png)
-
-*Caption: `engine ps` lists all containers with metadata. Both containers are in `running` state.*
-
----
-
-### Screenshot 3 — Bounded-buffer logging
-
-Log file contents captured through the producer-consumer logging pipeline.
-
-![Log file](screenshots/task3/log_output.png)
-
-*Caption: Contents of `/tmp/engine_logs/alpha.log` — container stdout/stderr captured via pipe, buffered in the ring buffer, and flushed to disk by the logger consumer thread.*
-
----
-
-### Screenshot 4 — CLI and IPC (UNIX socket)
-
-A CLI `stop` command being issued and the supervisor responding over the UNIX domain socket.
-
-![CLI IPC](screenshots/task4/cli_stop.png)
-
-*Caption: `engine stop alpha` sends a command over the UNIX domain socket at `/tmp/engine_ctrl.sock`; supervisor responds with `OK stop signaled for alpha`.*
-
----
-
-### Screenshot 5 — Soft-limit warning
-
-`dmesg` showing the kernel module logging a soft-limit warning for a container process.
-
-![Soft limit warning](screenshots/task5/soft_limit_dmesg.png)
-
-*Caption: `dmesg | grep container_monitor` shows the soft-limit warning line when `memory_hog` inside `memtest` container exceeded 48 MiB RSS.*
-
----
-
-### Screenshot 6 — Hard-limit enforcement
-
-`dmesg` showing SIGKILL sent when RSS exceeds hard limit, and `engine ps` showing the container state as `hard_limit_killed`.
-
-![Hard limit kill](screenshots/task6/hard_limit_dmesg.png)
-
-*Caption: Monitor sent SIGKILL when RSS exceeded 64 MiB. `engine ps` shows state = `hard_limit_killed`.*
-
----
-
-### Screenshot 7 — Scheduling experiment
-
-Terminal output from two CPU-bound containers run at different nice values.
-
-![Scheduling experiment](screenshots/task7/scheduling.png)
-
-*Caption: `cpu_hi` (nice -10) completed ~2× more iterations than `cpu_lo` (nice +10) over the same 30-second window, demonstrating CFS priority weighting.*
-
----
-
-### Screenshot 8 — Clean teardown
-
-`ps aux` after supervisor shutdown showing no zombie processes; supervisor exit messages.
-
-![Clean teardown](screenshots/task8/teardown.png)
-
-*Caption: After `Ctrl+C` on supervisor: log threads joined, children reaped, no zombies in `ps aux`. `dmesg` confirms module unloaded cleanly.*
-
----
-
-## 4. Engineering Analysis
-
-### 4.1 Isolation Mechanisms
+### 3.1 Isolation Mechanisms
 
 Linux containers rely on **namespaces** to partition global kernel resources. This runtime creates containers with three namespaces via `clone()` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS`:
 
@@ -253,7 +167,7 @@ The host kernel, however, continues to share: the network stack (no `CLONE_NEWNE
 
 `chroot` restricts filesystem visibility at the VFS layer without kernel-level namespace isolation. `clone()` with `CLONE_NEWNS` is stronger — it gives the container its own mount table so changes do not propagate back to the host.
 
-### 4.2 Supervisor and Process Lifecycle
+### 3.2 Supervisor and Process Lifecycle
 
 A long-running supervisor is valuable because:
 
@@ -263,7 +177,7 @@ A long-running supervisor is valuable because:
 
 Process creation flow: `clone()` → new namespace setup in child → `execv()` of the container command. The parent records host PID and state under the mutex. On exit, `SIGCHLD` triggers the handler, which calls `waitpid`, reads exit status, and updates state as `stopped`, `killed`, or `hard_limit_killed` based on the `stop_requested` flag and termination signal.
 
-### 4.3 IPC, Threads, and Synchronization
+### 3.3 IPC, Threads, and Synchronization
 
 The project uses two IPC mechanisms:
 
@@ -277,7 +191,7 @@ The project uses two IPC mechanisms:
 - **Synchronization choice:** `pthread_mutex_t` protects the ring buffer state. `pthread_cond_t not_full` blocks producers when the buffer is full; `pthread_cond_t not_empty` blocks the consumer when empty. This is the classic producer-consumer pattern avoiding both busy-waiting and deadlock. A `spinlock` was rejected because producers may block on I/O (pipe read) and we do not want to hold a spinlock across blocking calls. A semaphore pair works but requires two atomic counters; a condvar pair is more expressive and avoids missed wakeups.
 - **Container metadata (`containers[]`):** protected by `containers_mu` (mutex). The SIGCHLD handler must also acquire this lock; since signal handlers run in an arbitrary thread context, `pthread_mutex_lock` is safe here (it is async-signal-safe on Linux with `SA_RESTART`).
 
-### 4.4 Memory Management and Enforcement
+### 3.4 Memory Management and Enforcement
 
 **RSS (Resident Set Size)** measures the number of physical pages currently mapped into a process's address space and backed by RAM. It does not measure:
 - Pages that have been swapped out (swap usage)
@@ -290,7 +204,7 @@ The project uses two IPC mechanisms:
 
 **Why enforcement belongs in kernel space:** a user-space loop that reads `/proc/<pid>/status` and sends SIGKILL is subject to scheduling delays. Between a memory check and a kill, the process could allocate gigabytes more. A kernel timer runs in kernel context with direct access to `mm_struct` and can issue SIGKILL atomically relative to the memory state it observed. It also cannot be preempted by the very process it is trying to kill. The kernel module uses `get_mm_rss(task->mm)` to read RSS directly from the kernel's own page accounting, which is always current.
 
-### 4.5 Scheduling Behavior
+### 3.5 Scheduling Behavior
 
 Linux uses the **Completely Fair Scheduler (CFS)** for normal processes. CFS tracks `vruntime` — a virtual clock that advances in proportion to how much CPU time a task has used, weighted by its priority. Processes with lower `vruntime` are scheduled next.
 
@@ -304,7 +218,7 @@ For the CPU-bound vs I/O-bound comparison: `io_pulse` voluntarily sleeps after e
 
 ---
 
-## 5. Design Decisions and Tradeoffs
+## 4. Design Decisions and Tradeoffs
 
 ### Namespace Isolation
 **Choice:** `clone()` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS` and `chroot()`.  
@@ -333,7 +247,7 @@ For the CPU-bound vs I/O-bound comparison: `io_pulse` voluntarily sleeps after e
 
 ---
 
-## 6. Scheduler Experiment Results
+## 5. Scheduler Experiment Results
 
 ### Experiment 1: Two CPU-bound containers with different priorities
 
