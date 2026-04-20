@@ -13,14 +13,18 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sched.h>
 #include <pthread.h>
+
+#include "monitor_ioctl.h"
 
 #define MAX_CONTAINERS 16
 #define MAX_NAME 64
 #define MAX_CMD_ARGS 32
 #define SOCK_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
+#define MONITOR_DEV "/dev/container_monitor"
 
 #define STACK_SIZE (1024 * 1024)
 static char clone_stack[STACK_SIZE];
@@ -39,12 +43,18 @@ typedef struct {
     time_t start_time;
     ContainerState state;
     int stop_requested;
+
     int pipe_rd;
     char log_path[256];
+
+    unsigned long soft_limit;
+    unsigned long hard_limit;
+
 } Container;
 
 static Container containers[MAX_CONTAINERS];
 static int supervisor_running = 1;
+static int monitor_fd = -1;
 
 /* ───────────── container entry ───────────── */
 
@@ -57,7 +67,8 @@ typedef struct {
     int interactive;
 } Args;
 
-static int container_main(void *arg) {
+static int container_main(void *arg)
+{
     Args *a = (Args *)arg;
 
     sethostname(a->name, strlen(a->name));
@@ -85,33 +96,52 @@ static int container_main(void *arg) {
         argv[i] = a->cmd[i];
     argv[a->argc] = NULL;
 
-    if (a->interactive && strcmp(argv[0], "/bin/sh") == 0) {
+    if (a->interactive && strcmp(argv[0], "/bin/sh") == 0)
         execl("/bin/sh", "/bin/sh", "-i", NULL);
-    } else {
+    else
         execv(argv[0], argv);
-    }
 
     perror("exec");
     return 1;
 }
 
-/* ───────────── logging thread ───────────── */
+/* ───────────── monitor helpers ───────────── */
 
-static void *log_reader(void *arg) {
+static void register_monitor(pid_t pid, unsigned long soft, unsigned long hard)
+{
+    if (monitor_fd < 0) return;
+
+    struct monitor_request req = {0};
+    req.pid = pid;
+    req.soft_limit_bytes = soft;
+    req.hard_limit_bytes = hard;
+
+    ioctl(monitor_fd, MONITOR_REGISTER, &req);
+}
+
+static void unregister_monitor(pid_t pid)
+{
+    if (monitor_fd < 0) return;
+
+    struct monitor_request req = {0};
+    req.pid = pid;
+
+    ioctl(monitor_fd, MONITOR_UNREGISTER, &req);
+}
+
+/* ───────────── logging ───────────── */
+
+static void *log_reader(void *arg)
+{
     Container *c = (Container *)arg;
 
     int fd = open(c->log_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
-    if (fd < 0) {
-        perror("log open");
-        return NULL;
-    }
 
     char buf[4096];
     ssize_t n;
 
-    while ((n = read(c->pipe_rd, buf, sizeof(buf))) > 0) {
+    while ((n = read(c->pipe_rd, buf, sizeof(buf))) > 0)
         write(fd, buf, n);
-    }
 
     close(fd);
     close(c->pipe_rd);
@@ -120,26 +150,27 @@ static void *log_reader(void *arg) {
 
 /* ───────────── helpers ───────────── */
 
-static Container *alloc_container() {
-    for (int i = 0; i < MAX_CONTAINERS; i++) {
+static Container *alloc_container()
+{
+    for (int i = 0; i < MAX_CONTAINERS; i++)
         if (containers[i].state == STATE_EMPTY)
             return &containers[i];
-    }
     return NULL;
 }
 
-static Container *find_container(const char *name) {
-    for (int i = 0; i < MAX_CONTAINERS; i++) {
+static Container *find_container(const char *name)
+{
+    for (int i = 0; i < MAX_CONTAINERS; i++)
         if (containers[i].state != STATE_EMPTY &&
             strcmp(containers[i].name, name) == 0)
             return &containers[i];
-    }
     return NULL;
 }
 
 /* ───────────── SIGCHLD ───────────── */
 
-static void sigchld_handler(int sig) {
+static void sigchld_handler(int sig)
+{
     (void)sig;
     int status;
     pid_t pid;
@@ -148,6 +179,7 @@ static void sigchld_handler(int sig) {
         for (int i = 0; i < MAX_CONTAINERS; i++) {
             if (containers[i].host_pid == pid) {
                 containers[i].state = STATE_STOPPED;
+                unregister_monitor(pid);
                 break;
             }
         }
@@ -157,24 +189,23 @@ static void sigchld_handler(int sig) {
 /* ───────────── launch ───────────── */
 
 static pid_t launch_container(const char *name, const char *rootfs,
-                              char *argv[], int interactive) {
-
+                              char *argv[], int interactive,
+                              unsigned long soft, unsigned long hard)
+{
     Container *c = alloc_container();
     if (!c) return -1;
 
     memset(c, 0, sizeof(*c));
     strcpy(c->name, name);
-    c->state = STATE_STARTING;
-    c->start_time = time(NULL);
+
+    c->soft_limit = soft;
+    c->hard_limit = hard;
 
     snprintf(c->log_path, sizeof(c->log_path), "%s/%s.log", LOG_DIR, name);
 
     int pipefd[2];
     if (!interactive) {
-        if (pipe(pipefd) < 0) {
-            perror("pipe");
-            return -1;
-        }
+        pipe(pipefd);
         c->pipe_rd = pipefd[0];
     }
 
@@ -184,7 +215,7 @@ static pid_t launch_container(const char *name, const char *rootfs,
     args->interactive = interactive;
 
     int i = 0;
-    while (argv[i] && i < MAX_CMD_ARGS) {
+    while (argv[i]) {
         strcpy(args->cmd[i], argv[i]);
         i++;
     }
@@ -196,14 +227,8 @@ static pid_t launch_container(const char *name, const char *rootfs,
         CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
         args);
 
-    if (pid < 0) {
-        perror("clone");
-        return -1;
-    }
-
     if (!interactive) {
         close(pipefd[1]);
-
         pthread_t t;
         pthread_create(&t, NULL, log_reader, c);
         pthread_detach(t);
@@ -212,89 +237,74 @@ static pid_t launch_container(const char *name, const char *rootfs,
     c->host_pid = pid;
     c->state = STATE_RUNNING;
 
-    printf("[supervisor] container %s started (pid=%d)\n", name, pid);
+    register_monitor(pid, soft, hard);
 
     return pid;
 }
 
 /* ───────────── IPC ───────────── */
 
-static void handle_client(int cfd) {
+static void handle_client(int cfd)
+{
     char buf[1024];
-    ssize_t n = recv(cfd, buf, sizeof(buf)-1, 0);
-    if (n <= 0) { close(cfd); return; }
+    int n = recv(cfd, buf, sizeof(buf)-1, 0);
     buf[n] = '\0';
 
     char *tok[16];
     int tc = 0;
-    char *p = strtok(buf, " \t\n");
-    while (p && tc < 16) {
+
+    char *p = strtok(buf, " \n");
+    while (p) {
         tok[tc++] = p;
-        p = strtok(NULL, " \t\n");
+        p = strtok(NULL, " \n");
     }
 
-    char reply[2048] = {0};
+    char reply[1024] = {0};
 
     if (strcmp(tok[0], "start") == 0 || strcmp(tok[0], "run") == 0) {
+
         int interactive = strcmp(tok[0], "run") == 0;
+
+        unsigned long soft = 40UL << 20;
+        unsigned long hard = 64UL << 20;
 
         char *cmdv[MAX_CMD_ARGS];
         int cmdc = 0;
 
-        for (int i = 3; i < tc; i++)
-            cmdv[cmdc++] = tok[i];
+        for (int i = 3; i < tc; i++) {
+            if (!strcmp(tok[i], "--soft-mib"))
+                soft = strtoul(tok[++i], NULL, 10) << 20;
+            else if (!strcmp(tok[i], "--hard-mib"))
+                hard = strtoul(tok[++i], NULL, 10) << 20;
+            else
+                cmdv[cmdc++] = tok[i];
+        }
+
         cmdv[cmdc] = NULL;
 
-        pid_t pid = launch_container(tok[1], tok[2], cmdv, interactive);
+        pid_t pid = launch_container(tok[1], tok[2], cmdv,
+                                     interactive, soft, hard);
 
-        if (interactive && pid > 0) {
-            waitpid(pid, NULL, 0);
-            sprintf(reply, "OK run finished\n");
-        } else {
-            sprintf(reply, "OK started\n");
-        }
+        sprintf(reply, "OK pid=%d\n", pid);
     }
 
-    else if (strcmp(tok[0], "ps") == 0) {
+    else if (!strcmp(tok[0], "ps")) {
         for (int i = 0; i < MAX_CONTAINERS; i++) {
             if (containers[i].state != STATE_EMPTY) {
                 char line[128];
-                sprintf(line, "%s pid=%d state=%d\n",
+                sprintf(line, "%s pid=%d\n",
                         containers[i].name,
-                        containers[i].host_pid,
-                        containers[i].state);
+                        containers[i].host_pid);
                 strcat(reply, line);
             }
         }
     }
 
-    else if (strcmp(tok[0], "logs") == 0) {
-        Container *c = find_container(tok[1]);
-        if (!c) {
-            sprintf(reply, "ERR not found\n");
-        } else {
-            int fd = open(c->log_path, O_RDONLY);
-            if (fd < 0) {
-                sprintf(reply, "No logs\n");
-            } else {
-                char buf2[1024];
-                int n2;
-                while ((n2 = read(fd, buf2, sizeof(buf2))) > 0)
-                    send(cfd, buf2, n2, 0);
-                close(fd);
-                close(cfd);
-                return;
-            }
-        }
-    }
-
-    else if (strcmp(tok[0], "stop") == 0) {
+    else if (!strcmp(tok[0], "stop")) {
         Container *c = find_container(tok[1]);
         if (c) {
             kill(c->host_pid, SIGTERM);
             sprintf(reply, "OK stopped\n");
-        } else {
-            sprintf(reply, "ERR not found\n");
         }
     }
 
@@ -304,8 +314,13 @@ static void handle_client(int cfd) {
 
 /* ───────────── supervisor ───────────── */
 
-static void run_supervisor() {
+static void run_supervisor()
+{
     mkdir(LOG_DIR, 0755);
+
+    monitor_fd = open(MONITOR_DEV, O_RDWR);
+    if (monitor_fd >= 0)
+        printf("monitor connected\n");
 
     signal(SIGCHLD, sigchld_handler);
 
@@ -321,18 +336,16 @@ static void run_supervisor() {
     listen(srv, 8);
     chmod(SOCK_PATH, 0777);
 
-    printf("[supervisor] ready\n");
-
-    while (supervisor_running) {
+    while (1) {
         int cfd = accept(srv, NULL, NULL);
-        if (cfd < 0) continue;
         handle_client(cfd);
     }
 }
 
 /* ───────────── client ───────────── */
 
-static void run_client(int argc, char *argv[]) {
+static void run_client(int argc, char *argv[])
+{
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
 
     struct sockaddr_un addr = {0};
@@ -350,29 +363,24 @@ static void run_client(int argc, char *argv[]) {
 
     send(sock, buf, strlen(buf), 0);
 
-    char reply[2048];
+    char reply[1024];
     int n = recv(sock, reply, sizeof(reply)-1, 0);
     reply[n] = '\0';
 
     printf("%s", reply);
-
     close(sock);
 }
 
 /* ───────────── main ───────────── */
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
+    if (argc < 2) return 1;
 
-    if (argc < 2) {
-        printf("Usage: engine supervisor|start|run|ps|stop|logs\n");
-        return 1;
-    }
-
-    if (strcmp(argv[1], "supervisor") == 0) {
+    if (!strcmp(argv[1], "supervisor"))
         run_supervisor();
-    } else {
+    else
         run_client(argc, argv);
-    }
 
     return 0;
 }
