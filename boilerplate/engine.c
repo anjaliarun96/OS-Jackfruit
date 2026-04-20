@@ -14,11 +14,13 @@
 #include <sys/un.h>
 #include <sys/mount.h>
 #include <sched.h>
+#include <pthread.h>
 
 #define MAX_CONTAINERS 16
 #define MAX_NAME 64
 #define MAX_CMD_ARGS 32
 #define SOCK_PATH "/tmp/mini_runtime.sock"
+#define LOG_DIR "logs"
 
 #define STACK_SIZE (1024 * 1024)
 static char clone_stack[STACK_SIZE];
@@ -37,6 +39,8 @@ typedef struct {
     time_t start_time;
     ContainerState state;
     int stop_requested;
+    int pipe_rd;
+    char log_path[256];
 } Container;
 
 static Container containers[MAX_CONTAINERS];
@@ -49,6 +53,7 @@ typedef struct {
     char cmd[MAX_CMD_ARGS][256];
     int argc;
     char name[MAX_NAME];
+    int pipe_wr;
     int interactive;
 } Args;
 
@@ -69,6 +74,12 @@ static int container_main(void *arg) {
 
     chdir("/");
 
+    if (!a->interactive) {
+        dup2(a->pipe_wr, STDOUT_FILENO);
+        dup2(a->pipe_wr, STDERR_FILENO);
+        close(a->pipe_wr);
+    }
+
     char *argv[MAX_CMD_ARGS + 1];
     for (int i = 0; i < a->argc; i++)
         argv[i] = a->cmd[i];
@@ -82,6 +93,29 @@ static int container_main(void *arg) {
 
     perror("exec");
     return 1;
+}
+
+/* ───────────── logging thread ───────────── */
+
+static void *log_reader(void *arg) {
+    Container *c = (Container *)arg;
+
+    int fd = open(c->log_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) {
+        perror("log open");
+        return NULL;
+    }
+
+    char buf[4096];
+    ssize_t n;
+
+    while ((n = read(c->pipe_rd, buf, sizeof(buf))) > 0) {
+        write(fd, buf, n);
+    }
+
+    close(fd);
+    close(c->pipe_rd);
+    return NULL;
 }
 
 /* ───────────── helpers ───────────── */
@@ -133,6 +167,17 @@ static pid_t launch_container(const char *name, const char *rootfs,
     c->state = STATE_STARTING;
     c->start_time = time(NULL);
 
+    snprintf(c->log_path, sizeof(c->log_path), "%s/%s.log", LOG_DIR, name);
+
+    int pipefd[2];
+    if (!interactive) {
+        if (pipe(pipefd) < 0) {
+            perror("pipe");
+            return -1;
+        }
+        c->pipe_rd = pipefd[0];
+    }
+
     Args *args = calloc(1, sizeof(Args));
     strcpy(args->rootfs, rootfs);
     strcpy(args->name, name);
@@ -145,6 +190,8 @@ static pid_t launch_container(const char *name, const char *rootfs,
     }
     args->argc = i;
 
+    args->pipe_wr = interactive ? -1 : pipefd[1];
+
     pid_t pid = clone(container_main, clone_stack + STACK_SIZE,
         CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
         args);
@@ -152,6 +199,14 @@ static pid_t launch_container(const char *name, const char *rootfs,
     if (pid < 0) {
         perror("clone");
         return -1;
+    }
+
+    if (!interactive) {
+        close(pipefd[1]);
+
+        pthread_t t;
+        pthread_create(&t, NULL, log_reader, c);
+        pthread_detach(t);
     }
 
     c->host_pid = pid;
@@ -166,7 +221,7 @@ static pid_t launch_container(const char *name, const char *rootfs,
 
 static void handle_client(int cfd) {
     char buf[1024];
-    ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
+    ssize_t n = recv(cfd, buf, sizeof(buf)-1, 0);
     if (n <= 0) { close(cfd); return; }
     buf[n] = '\0';
 
@@ -178,29 +233,25 @@ static void handle_client(int cfd) {
         p = strtok(NULL, " \t\n");
     }
 
-    char reply[1024] = {0};
+    char reply[2048] = {0};
 
     if (strcmp(tok[0], "start") == 0 || strcmp(tok[0], "run") == 0) {
-        if (tc < 4) {
-            sprintf(reply, "ERR usage\n");
+        int interactive = strcmp(tok[0], "run") == 0;
+
+        char *cmdv[MAX_CMD_ARGS];
+        int cmdc = 0;
+
+        for (int i = 3; i < tc; i++)
+            cmdv[cmdc++] = tok[i];
+        cmdv[cmdc] = NULL;
+
+        pid_t pid = launch_container(tok[1], tok[2], cmdv, interactive);
+
+        if (interactive && pid > 0) {
+            waitpid(pid, NULL, 0);
+            sprintf(reply, "OK run finished\n");
         } else {
-            int interactive = strcmp(tok[0], "run") == 0;
-
-            char *cmdv[MAX_CMD_ARGS];
-            int cmdc = 0;
-
-            for (int i = 3; i < tc; i++)
-                cmdv[cmdc++] = tok[i];
-            cmdv[cmdc] = NULL;
-
-            pid_t pid = launch_container(tok[1], tok[2], cmdv, interactive);
-
-            if (interactive && pid > 0) {
-                waitpid(pid, NULL, 0);
-                sprintf(reply, "OK run finished\n");
-            } else {
-                sprintf(reply, "OK started\n");
-            }
+            sprintf(reply, "OK started\n");
         }
     }
 
@@ -217,6 +268,26 @@ static void handle_client(int cfd) {
         }
     }
 
+    else if (strcmp(tok[0], "logs") == 0) {
+        Container *c = find_container(tok[1]);
+        if (!c) {
+            sprintf(reply, "ERR not found\n");
+        } else {
+            int fd = open(c->log_path, O_RDONLY);
+            if (fd < 0) {
+                sprintf(reply, "No logs\n");
+            } else {
+                char buf2[1024];
+                int n2;
+                while ((n2 = read(fd, buf2, sizeof(buf2))) > 0)
+                    send(cfd, buf2, n2, 0);
+                close(fd);
+                close(cfd);
+                return;
+            }
+        }
+    }
+
     else if (strcmp(tok[0], "stop") == 0) {
         Container *c = find_container(tok[1]);
         if (c) {
@@ -227,14 +298,6 @@ static void handle_client(int cfd) {
         }
     }
 
-    else if (strcmp(tok[0], "logs") == 0) {
-        sprintf(reply, "Logs not implemented yet\n");
-    }
-
-    else {
-        sprintf(reply, "ERR unknown\n");
-    }
-
     send(cfd, reply, strlen(reply), 0);
     close(cfd);
 }
@@ -242,7 +305,7 @@ static void handle_client(int cfd) {
 /* ───────────── supervisor ───────────── */
 
 static void run_supervisor() {
-    printf("[supervisor] starting\n");
+    mkdir(LOG_DIR, 0755);
 
     signal(SIGCHLD, sigchld_handler);
 
@@ -301,7 +364,7 @@ static void run_client(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
 
     if (argc < 2) {
-        printf("Usage: engine supervisor|start|run|ps|stop\n");
+        printf("Usage: engine supervisor|start|run|ps|stop|logs\n");
         return 1;
     }
 
